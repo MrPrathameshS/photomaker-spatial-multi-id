@@ -179,7 +179,7 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         pretrained_model_name_or_path_or_dict: Union[str, Dict[str, torch.Tensor]],
         weight_name: str,
         subfolder: str = '',
-        trigger_word: str = 'img',
+        trigger_words: Optional[List[str]] = None,
         pm_version: str = 'v2',
         **kwargs,
     ):
@@ -201,7 +201,9 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
             subfolder (`str`, defaults to `""`):
                 The subfolder location of a model file within a larger model repository on the Hub or locally.
 
-            trigger_word (`str`, *optional*, defaults to `"img"`):
+            trigger_words (`List[str]`, optional):
+                A list of trigger tokens, one per identity.
+            :
                 The trigger word is used to identify the position of class word in the text prompt, 
                 and it is recommended not to set it as a common word. 
                 This trigger word must be placed after the class word when used, otherwise, it will affect the performance of the personalized generation.           
@@ -227,7 +229,6 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                 weights_name=weight_name,
                 cache_dir=cache_dir,
                 force_download=force_download,
-                resume_download=resume_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
                 token=token,
@@ -252,8 +253,13 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         if keys != ["id_encoder", "lora_weights"]:
             raise ValueError("Required keys are (`id_encoder` and `lora_weights`) missing from the state dict.")
 
-        self.num_tokens =2
-        self.trigger_word = trigger_word
+        if trigger_words is None:
+            trigger_words = ["img1", "img2"]
+
+        self.trigger_words = trigger_words
+        self.num_identities = len(trigger_words)
+        self.num_tokens = 2   # tokens per identity
+
         # load finetuned CLIP image encoder and fuse module here if it has not been registered to the pipeline yet
         print(f"Loading PhotoMaker {pm_version} components [1] id_encoder from [{pretrained_model_name_or_path_or_dict}]...")
         self.id_image_processor = CLIPImageProcessor()
@@ -273,10 +279,22 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         self.load_lora_weights(state_dict["lora_weights"], adapter_name="photomaker")
 
         # Add trigger word token
-        if self.tokenizer is not None: 
-            self.tokenizer.add_tokens([self.trigger_word], special_tokens=True)
-        
-        self.tokenizer_2.add_tokens([self.trigger_word], special_tokens=True)
+        if self.tokenizer is not None:
+            num_added = self.tokenizer.add_tokens(self.trigger_words, special_tokens=True)
+            if num_added > 0:
+                self.text_encoder.resize_token_embeddings(len(self.tokenizer))
+
+        num_added_2 = self.tokenizer_2.add_tokens(self.trigger_words, special_tokens=True)
+        if num_added_2 > 0:
+            self.text_encoder_2.resize_token_embeddings(len(self.tokenizer_2))
+
+
+        if self.text_encoder is not None:
+            self.text_encoder.resize_token_embeddings(len(self.tokenizer))
+
+        self.text_encoder_2.resize_token_embeddings(len(self.tokenizer_2))
+
+
         
 
     def encode_prompt_with_trigger_word(
@@ -325,8 +343,22 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         else:
             batch_size = prompt_embeds.shape[0]
 
-        # Find the token id of the trigger word
-        image_token_id = self.tokenizer_2.convert_tokens_to_ids(self.trigger_word)
+        # Find the token id of the trigger words
+        active_triggers = self.trigger_words[:num_id_images]
+
+        trigger_token_ids = [
+            self.tokenizer_2.convert_tokens_to_ids(t)
+            for t in active_triggers
+        ]
+
+        print("Trigger words:", active_triggers)
+        print("\n==============================")
+        print("🔎 MULTI-TRIGGER DEBUG")
+        print("Trigger words:", active_triggers)
+        print("Trigger token IDs:", trigger_token_ids)
+        print("==============================\n")
+
+
 
         # Define tokenizers and text encoders
         tokenizers = [self.tokenizer, self.tokenizer_2] if self.tokenizer is not None else [self.tokenizer_2]
@@ -353,7 +385,11 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                     return_tensors="pt",
                 )
 
-                text_input_ids = text_inputs.input_ids 
+                text_input_ids = text_inputs.input_ids
+                decoded = self.tokenizer_2.convert_ids_to_tokens(text_input_ids[0])
+                print("🔎 Tokenized prompt:")
+                print(decoded)
+                
                 untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
                 if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
@@ -365,43 +401,86 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                         f" {tokenizer.model_max_length} tokens: {removed_text}"
                     )
 
-                clean_index = 0
+                # --------------------------------------------------
+                # CLEAN MULTI-TRIGGER PARSING (FINAL CORRECT VERSION)
+                # --------------------------------------------------
+
+                input_ids = text_input_ids[0].tolist()
+
                 clean_input_ids = []
-                class_token_index = []
-                # Find out the corresponding class word token based on the newly added trigger word token
-                for i, token_id in enumerate(text_input_ids.tolist()[0]):
-                    if token_id == image_token_id:
-                        class_token_index.append(clean_index - 1)
-                    else:
-                        clean_input_ids.append(token_id)
-                        clean_index += 1
+                class_tokens_mask = []
 
-                if len(class_token_index) != 1:
+                identity_count = 0
+
+                i = 0
+                while i < len(input_ids):
+
+                    token_id = input_ids[i]
+
+                    # If token is a trigger word
+                    if token_id in trigger_token_ids:
+
+                        if len(clean_input_ids) == 0:
+                            raise ValueError("Trigger word cannot appear at start of prompt.")
+
+                        # The class token is the previous token
+                        class_token = clean_input_ids[-1]
+
+                        # Remove previous class token
+                        clean_input_ids.pop()
+                        class_tokens_mask.pop()
+
+                        # Expand into identity tokens
+                        for _ in range(self.num_tokens):
+                            clean_input_ids.append(class_token)
+                            class_tokens_mask.append(True)
+
+                        identity_count += 1
+                        i += 1
+                        continue
+
+                    # Normal token
+                    clean_input_ids.append(token_id)
+                    class_tokens_mask.append(False)
+                    i += 1
+
+
+                # Validate trigger count
+                if identity_count != num_id_images:
                     raise ValueError(
-                        f"PhotoMaker currently does not support multiple trigger words in a single prompt.\
-                            Trigger word: {self.trigger_word}, Prompt: {prompt}."
+                        f"Expected {self.num_identities} triggers {self.trigger_words}, "
+                        f"but found {identity_count} in prompt."
                     )
-                class_token_index = class_token_index[0]
 
-                # Expand the class word token and corresponding mask
-                class_token = clean_input_ids[class_token_index]
-                clean_input_ids = clean_input_ids[:class_token_index] + [class_token] * num_id_images * self.num_tokens + \
-                    clean_input_ids[class_token_index+1:]                
-                    
-                # Truncation or padding
+
+                # Truncate or pad
                 max_len = tokenizer.model_max_length
+
                 if len(clean_input_ids) > max_len:
                     clean_input_ids = clean_input_ids[:max_len]
+                    class_tokens_mask = class_tokens_mask[:max_len]
                 else:
-                    clean_input_ids = clean_input_ids + [tokenizer.pad_token_id] * (
-                        max_len - len(clean_input_ids)
-                    )
+                    pad_len = max_len - len(clean_input_ids)
+                    clean_input_ids += [tokenizer.pad_token_id] * pad_len
+                    class_tokens_mask += [False] * pad_len
 
-                class_tokens_mask = [True if class_token_index <= i < class_token_index+(num_id_images * self.num_tokens) else False \
-                     for i in range(len(clean_input_ids))]
-                
+
                 clean_input_ids = torch.tensor(clean_input_ids, dtype=torch.long).unsqueeze(0)
                 class_tokens_mask = torch.tensor(class_tokens_mask, dtype=torch.bool).unsqueeze(0)
+
+                print("🔍 num_id_images:", num_id_images)
+                print("🔍 self.num_tokens:", self.num_tokens)
+
+                expected_identity_tokens = num_id_images * self.num_tokens
+
+                actual_identity_tokens = class_tokens_mask.sum().item()
+                print("\n🔎 Identity Token Debug:")
+                print("Expected identity token slots:", expected_identity_tokens)
+                print("Mask True count:", actual_identity_tokens)
+                print("Mask True indices:", torch.tensor(class_tokens_mask[0]).nonzero().flatten().tolist())
+
+                print("🔍 Mask True count:", actual_identity_tokens)
+
 
                 prompt_embeds = text_encoder(clean_input_ids.to(device), output_hidden_states=True)
 
@@ -559,14 +638,18 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         adapter_conditioning_factor: float = 1.0,
         clip_skip: Optional[int] = None,
         # Added parameters (for PhotoMaker)
-        input_id_images: PipelineImageInput = None,
+        input_id_images=None,
+        id_pixel_values=None,
         start_merge_step: int = 10, # TODO: change to `style_strength_ratio` in the future
         class_tokens_mask: Optional[torch.LongTensor] = None,
         id_embeds: Optional[torch.FloatTensor] = None,
         prompt_embeds_text_only: Optional[torch.FloatTensor] = None,
         pooled_prompt_embeds_text_only: Optional[torch.FloatTensor] = None,
+        identity_bboxes: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
+        print("🔥 id_pixel_values received:", id_pixel_values.shape if id_pixel_values is not None else None)
+        print("🔥 id_embeds received:", id_embeds.shape if id_embeds is not None else None)
         r"""
         Function invoked when calling the pipeline for generation.
         Only the parameters introduced by PhotoMaker are discussed here. 
@@ -589,6 +672,8 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
             [`~pipelines.stable_diffusion_xl.StableDiffusionXLPipelineOutput`] if `return_dict` is True, otherwise a
             `tuple`. When returning a tuple, the first element is a list with the generated images.
         """
+        print("🔥 id_pixel_values:", None if id_pixel_values is None else id_pixel_values.shape)
+        print("🔥 id_embeds:", None if id_embeds is None else id_embeds.shape)
         height, width = self._default_height_width(height, width, image)
         device = self._execution_device
         
@@ -608,8 +693,16 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
 
         original_size = original_size or (height, width)
         target_size = target_size or (height, width)
+        
+
 
         # 1. Check inputs. Raise error if not correct
+        self.identity_bboxes = identity_bboxes
+
+        if identity_bboxes is not None:
+            identity_bboxes = identity_bboxes.to(device)
+
+
         self.check_inputs(
             prompt,
             prompt_2,
@@ -633,13 +726,52 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
             raise ValueError(
                 "If `prompt_embeds` are provided, `class_tokens_mask` also have to be passed. Make sure to generate `class_tokens_mask` from the same tokenizer that was used to generate `prompt_embeds`."
             )
-        # check the input id images
-        if input_id_images is None:
-            raise ValueError(
-                "Provide `input_id_images`. Cannot leave `input_id_images` undefined for PhotoMaker pipeline."
+        
+        # --------------------------------------------------
+        # STEP 1: Convert normalized bboxes to latent coords
+        # --------------------------------------------------
+
+        if self.identity_bboxes is not None:
+            num_ids = self.identity_bboxes.shape[0]
+            latent_h = height // 8
+            latent_w = width // 8
+
+            base_masks = torch.zeros(
+                (num_ids, latent_h, latent_w),
+                device=device
             )
-        if not isinstance(input_id_images, list):
-            input_id_images = [input_id_images]
+
+            for i, (x1, y1, x2, y2) in enumerate(self.identity_bboxes):
+
+                # Convert normalized → latent grid
+                x1_lat = int(x1 * latent_w)
+                x2_lat = int(x2 * latent_w)
+                y1_lat = int(y1 * latent_h)
+                y2_lat = int(y2 * latent_h)
+
+                # Clamp to valid bounds
+                x1_lat = max(0, min(latent_w - 1, x1_lat))
+                x2_lat = max(0, min(latent_w, x2_lat))
+                y1_lat = max(0, min(latent_h - 1, y1_lat))
+                y2_lat = max(0, min(latent_h, y2_lat))
+
+                base_masks[i, y1_lat:y2_lat, x1_lat:x2_lat] = 1.0
+            print("Base masks shape:", base_masks.shape)
+            for i in range(base_masks.shape[0]):
+                print(f"Mask {i} sum:", base_masks[i].sum().item())
+
+            if base_masks.shape[0] > 1:
+                print("Are masks equal:",
+                    torch.allclose(base_masks[0], base_masks[1]))
+
+
+            self.identity_base_masks = base_masks
+
+        
+       
+          
+
+
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -656,7 +788,22 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
         )
         
-        num_id_images = len(input_id_images)
+        if id_embeds is not None:
+            if id_embeds.dim() == 2:
+                # shape = [N, 512]
+                num_id_images = id_embeds.shape[0]
+            elif id_embeds.dim() == 3:
+                # shape = [B, N, 512]
+                num_id_images = id_embeds.shape[1]
+            else:
+                raise ValueError("Unexpected id_embeds shape")
+        else:
+            num_id_images = 1
+
+        print("🔍 id_embeds shape:", id_embeds.shape)
+        print("🔍 num_id_images:", num_id_images)
+
+
         
         (
             prompt_embeds, 
@@ -685,8 +832,18 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         # 4. Encode input prompt without the trigger word for delayed conditioning
         # encode, remove trigger word token, then decode
         tokens_text_only = self.tokenizer.encode(prompt, add_special_tokens=False)
-        trigger_word_token = self.tokenizer.convert_tokens_to_ids(self.trigger_word)
-        tokens_text_only.remove(trigger_word_token)
+        
+        active_triggers = self.trigger_words[:num_id_images]
+        trigger_token_ids = [
+            self.tokenizer_2.convert_tokens_to_ids(t)
+            for t in active_triggers
+        ]
+
+        tokens_text_only = [
+            t for t in tokens_text_only
+            if t not in trigger_token_ids
+        ]
+
         prompt_text_only = self.tokenizer.decode(tokens_text_only, add_special_tokens=False)
         (
             prompt_embeds_text_only,
@@ -709,19 +866,60 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
             clip_skip=self._clip_skip,
         )
 
-        # 5. Prepare the input ID images
-        dtype = next(self.id_encoder.parameters()).dtype
-        if not isinstance(input_id_images[0], torch.Tensor):
-            id_pixel_values = self.id_image_processor(input_id_images, return_tensors="pt").pixel_values
+        # 5. Prepare identity tensors (already processed in CLI)
 
-        id_pixel_values = id_pixel_values.unsqueeze(0).to(device=device, dtype=dtype) # TODO: multiple prompts
+        # 🔥 Convert input_id_images -> id_pixel_values if needed
+        if input_id_images is not None and id_pixel_values is None:
+            print("🔥 Converting input_id_images → id_pixel_values")
 
-        # 6. Get the update text embedding with the stacked ID embedding
-        if id_embeds is not None:
+            dtype = next(self.id_encoder.parameters()).dtype
+
+            if not isinstance(input_id_images[0], torch.Tensor):
+                id_pixel_values = self.id_image_processor(
+                    input_id_images,
+                    return_tensors="pt"
+                ).pixel_values
+
+            id_pixel_values = id_pixel_values.unsqueeze(0).to(
+                device=self.device,
+                dtype=dtype
+            )
+
+
+
+
+
+
+
+
+
+        
+        # 6. Get the updated text embedding with the stacked ID embedding
+        if id_pixel_values is not None and id_embeds is not None:
+
+            print("🔥 BEFORE unsqueeze id_embeds shape:", id_embeds.shape)
+
             id_embeds = id_embeds.unsqueeze(0).to(device=device, dtype=dtype)
-            prompt_embeds = self.id_encoder(id_pixel_values, prompt_embeds, class_tokens_mask, id_embeds)
+
+            print("🔍 prompt_embeds shape before injection:", prompt_embeds.shape)
+            print("🔍 class_tokens_mask True indices:",
+                class_tokens_mask[0].nonzero().flatten().tolist())
+            print("🔍 id_embeds shape:", id_embeds.shape)
+            print("🔥 AFTER unsqueeze id_embeds shape:", id_embeds.shape)
+            print("🔥 id_pixel_values shape:", id_pixel_values.shape)
+            print("🔥 class_tokens_mask True count:", class_tokens_mask.sum().item())
+            print("🔥 prompt_embeds shape:", prompt_embeds.shape)
+
+            prompt_embeds = self.id_encoder(
+                id_pixel_values,
+                prompt_embeds,
+                class_tokens_mask,
+                id_embeds
+            )
+
         else:
-            prompt_embeds = self.id_encoder(id_pixel_values, prompt_embeds, class_tokens_mask)
+            print("⚠️ Skipping ID injection (missing id_pixel_values or id_embeds)")
+
 
         bs_embed, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -813,6 +1011,24 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+
+        # --------------------------------------------------
+        # 🔥 ATTACH SPATIAL IDENTITY ATTENTION PROCESSOR HERE
+        # --------------------------------------------------
+
+        if hasattr(self, "base_identity_masks") and self.base_identity_masks is not None:
+
+            from photomaker.spatial_identity_attn import SpatialIdentityAttnProcessor
+            from diffusers.models.attention_processor import AttnProcessor2_0
+
+            print("🔥 Attaching SpatialIdentityAttnProcessor")
+
+            processor = SpatialIdentityAttnProcessor(
+                identity_token_indices=self.identity_token_indices,
+                base_masks=self.base_identity_masks
+            )
+
+            self.unet.set_attn_processor(processor)
 
         # 11. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)

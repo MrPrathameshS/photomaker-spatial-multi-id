@@ -5,4 +5,7 @@ outputs/
 __pycache__/
 .idea/
 *.bin
-*.safetensors
+*.safetensorsData/
+__pycache__/
+*.png
+*.jpg
