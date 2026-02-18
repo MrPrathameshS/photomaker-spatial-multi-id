@@ -25,7 +25,8 @@ from aspect_ratio_template import aspect_ratios
 from insightface.utils import face_align
 from PIL import Image
 import PIL.Image
-
+from photomaker.identity_prompt_parser import extract_identity_prompt_map_clean
+from photomaker.identity_evaluator import evaluate_identities_dynamic
 
 
 # ============================================================
@@ -34,13 +35,13 @@ import PIL.Image
 
 # Input image(s) - provide path(s) to face image(s)
 INPUT_IMAGES = [
-    "/teamspace/studios/this_studio/PhotoMaker/Data/Input/man_woman.jpg"  
+    "/teamspace/studios/this_studio/PhotoMaker/Data/Input/man_woman2.jpg"
 ]
 
 # Prompt - must include 'img' trigger word
-PROMPT = "a photo of man img1  and woman img2  "
+PROMPT = "a man img1 and a woman img2"
 
-# Output settings
+# Output settings 
 OUTPUT_DIR = "/teamspace/studios/this_studio/PhotoMaker/Data/Output"
 NUM_OUTPUTS = 2
 
@@ -98,60 +99,126 @@ from diffusers.models.attention_processor import AttnProcessor2_0
 
 
 def load_pipeline(device):
-    print("Loading pipeline...")
-    
-    base_model_path = 'SG161222/RealVisXL_V4.0'
-    
-    torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print("Loading pipeline...\n")
+
+    base_model_path = "SG161222/RealVisXL_V4.0"
+
+    # --------------------------------------------------
+    # 1️⃣ Torch dtype selection
+    # --------------------------------------------------
+    torch_dtype = (
+        torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+
     if device == "mps":
         torch_dtype = torch.float16
-    
+
+    # --------------------------------------------------
+    # 2️⃣ Load T2I Adapter
+    # --------------------------------------------------
     print("Loading T2I adapter...")
     adapter = T2IAdapter.from_pretrained(
-        "TencentARC/t2i-adapter-sketch-sdxl-1.0", 
-        torch_dtype=torch_dtype, 
-        variant="fp16"
-    ).to(device)
-    
-    print("Loading main pipeline...")
-    pipe = PhotoMakerStableDiffusionXLAdapterPipeline.from_pretrained(
-        base_model_path, 
-        adapter=adapter, 
+        "TencentARC/t2i-adapter-sketch-sdxl-1.0",
         torch_dtype=torch_dtype,
-        use_safetensors=True, 
         variant="fp16",
     ).to(device)
-    
+
+    # --------------------------------------------------
+    # 3️⃣ Load Base Pipeline
+    # --------------------------------------------------
+    print("Loading main pipeline...")
+    pipe = PhotoMakerStableDiffusionXLAdapterPipeline.from_pretrained(
+        base_model_path,
+        adapter=adapter,
+        torch_dtype=torch_dtype,
+        use_safetensors=True,
+        variant="fp16",
+    ).to(device)
+
+    # --------------------------------------------------
+    # 4️⃣ Load PhotoMaker Adapter (LoRA + ID encoder)
+    # --------------------------------------------------
     print("Loading PhotoMaker adapter...")
     photomaker_ckpt = hf_hub_download(
-        repo_id="TencentARC/PhotoMaker-V2", 
-        filename="photomaker-v2.bin", 
-        repo_type="model"
+        repo_id="TencentARC/PhotoMaker-V2",
+        filename="photomaker-v2.bin",
+        repo_type="model",
     )
-    
+
     pipe.load_photomaker_adapter(
         os.path.dirname(photomaker_ckpt),
         subfolder="",
         weight_name=os.path.basename(photomaker_ckpt),
-        trigger_words=["img1", "img2"],   # ✅ multi triggers
+        trigger_words=["img1", "img2"],
         pm_version="v2",
     )
+    print("\n🔥 APPLYING CONTROLLED LORA SCALE x1.5")
+
+    for name, module in pipe.unet.named_modules():
+        if hasattr(module, "scale"):
+            module.scale = 1.0
+
+    print("\n===== LORA NORM CHECK =====")
+    for name, param in pipe.unet.named_parameters():
+        if "photomaker" in name and "weight" in name:
+            print(name, torch.norm(param).item())
+            break
+
+
+
     pipe.id_encoder.to(device)
-    
+
+    # ==================================================
+    # 🔍 5️⃣ LoRA Module Inspection
+    # ==================================================
+    print("\n===== LORA MODULE INSPECTION =====")
+
+    found_lora = False
+    for name, module in pipe.unet.named_modules():
+        if "lora" in name.lower():
+            print("LoRA module:", name, "->", type(module))
+            found_lora = True
+
+    if not found_lora:
+        print("❌ No LoRA modules found in UNet.")
+
+    # ==================================================
+    # 🔍 6️⃣ LoRA Parameter Inspection
+    # ==================================================
+    print("\n===== LORA PARAMETER INSPECTION =====")
+
+    found_lora_params = False
+    for name, param in pipe.unet.named_parameters():
+        if "lora" in name.lower():
+            print("LoRA param:", name, param.shape)
+            found_lora_params = True
+
+    if not found_lora_params:
+        print("❌ No LoRA parameters found in UNet.")
+
+    # ==================================================
+    # 🔍 7️⃣ Attention Processor Audit
+    # ==================================================
     print("\n===== ATTENTION PROCESSOR AUDIT =====")
     for name, proc in pipe.unet.attn_processors.items():
         print(name, "->", type(proc).__name__)
-    
+
+    # --------------------------------------------------
+    # 8️⃣ Scheduler
+    # --------------------------------------------------
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-    
+
+    # Final device push
     pipe.to(device)
-    # 🔎 DEBUG HERE
-    print("🔍 feature_extractor:", pipe.feature_extractor)
+
+    print("\n🔍 feature_extractor:", pipe.feature_extractor)
     print("🔍 image_processor:", pipe.image_processor)
 
-    print("Pipeline loaded successfully!")
+    print("\nPipeline loaded successfully!\n")
 
     return pipe
+
 
 
 def load_face_detector(device):
@@ -308,27 +375,113 @@ def generate_image(pipe, face_detector, device):
             id_pixel_list.append(pixel_tensor)
             input_id_images.append(aligned_face)
 
+    
+
     # --------------------------------------------------
-    # Stack identities
+    # Safety check
     # --------------------------------------------------
     if len(id_embed_list) == 0:
         raise ValueError("❌ No valid faces found in any input images.")
 
-    id_embeds = torch.stack(id_embed_list)          # [N, 512]
-    id_pixel_values = torch.stack(id_pixel_list)   # [N, 3, 224, 224]
-    identity_bboxes = torch.tensor(bbox_list).float()  # [N, 4]
+    import torch.nn.functional as F
 
-    print("\n🔥 Total identities:", len(id_embed_list))
-    print("🔥 input_id_images length:", len(input_id_images))
-    print("🔥 Final id_embeds shape:", id_embeds.shape)
+    # --------------------------------------------------
+    # 🔥 ARC-FACE BASED IDENTITY GROUPING ACROSS IMAGES
+    # --------------------------------------------------
+
+    # Stack all detected face embeddings
+    all_embeds = torch.stack(id_embed_list)  # [N_total_faces, 512]
+    all_embeds = F.normalize(all_embeds, dim=1)
+
+    print("\n🔥 Total detected faces:", all_embeds.shape[0])
+
+    groups = []
+    threshold = 0.5  # tune between 0.45–0.6
+
+    for idx, embed in enumerate(all_embeds):
+
+        placed = False
+
+        for group in groups:
+            ref_idx = group[0]
+            similarity = torch.dot(embed, all_embeds[ref_idx]).item()
+
+            if similarity > threshold:
+                group.append(idx)
+                placed = True
+                break
+
+        if not placed:
+            groups.append([idx])
+
+    print("🔥 Number of identity groups found:", len(groups))
+
+    # --------------------------------------------------
+    # 🔥 AVERAGE EMBEDDINGS PER IDENTITY
+    # --------------------------------------------------
+
+    final_embeds = []
+    final_pixels = []
+    final_bboxes = []
+
+    for group_idx, group in enumerate(groups):
+
+        group_embeds = torch.stack([all_embeds[i] for i in group])
+        avg_embed = group_embeds.mean(dim=0)
+        avg_embed = torch.nn.functional.normalize(avg_embed, dim=0)
+
+
+        final_embeds.append(avg_embed)
+
+        # Use first occurrence for pixel + bbox
+        final_pixels.append(id_pixel_list[group[0]])
+        final_bboxes.append(bbox_list[group[0]])
+
+        print(f"   Identity {group_idx} → {len(group)} face(s) grouped")
+
+    # Stack final identities
+    id_embeds = torch.stack(final_embeds)              # [N_id, 512]
+    id_pixel_values = torch.stack(final_pixels)       # [N_id, 3, 224, 224]
+    identity_bboxes = torch.tensor(final_bboxes).float()
+
+    # --------------------------------------------------
+    # 🔥 FORCE LEFT → RIGHT IDENTITY ORDERING
+    # --------------------------------------------------
+
+    # Compute x-center for each identity bbox
+    x_centers = []
+
+    for bbox in identity_bboxes:
+        x1, y1, x2, y2 = bbox
+        x_center = (x1 + x2) / 2.0
+        x_centers.append(x_center.item())
+
+    # Sort identities by x-center (left → right)
+    sorted_indices = sorted(range(len(x_centers)), key=lambda i: x_centers[i])
+
+    print("🔥 Reordering identities left → right:", sorted_indices)
+
+    # Reorder everything consistently
+    identity_bboxes = identity_bboxes[sorted_indices]
+    id_embeds = id_embeds[sorted_indices]
+    id_pixel_values = id_pixel_values[sorted_indices]
+    
+    for i, bbox in enumerate(identity_bboxes):
+        x1, y1, x2, y2 = bbox
+        print(f"Identity {i} x-center:", (x1 + x2)/2)
+
+    # Save reference embeddings for evaluation
+    reference_arcface_embeds = id_embeds.clone().detach()
+
+    print("\n🔥 Final id_embeds shape:", id_embeds.shape)
     print("🔥 Final id_pixel_values shape:", id_pixel_values.shape)
-    print("🔥 identity_bboxes shape:", identity_bboxes.shape)
+    print("🔥 Final identity_bboxes shape:", identity_bboxes.shape)
 
     # --------------------------------------------------
-    # Multi-trigger validation (AFTER identity detection)
+    # 🔥 Multi-trigger validation (AFTER grouping)
     # --------------------------------------------------
 
-    num_identities = identity_bboxes.shape[0]
+    num_identities = id_embeds.shape[0]
     active_triggers = pipe.trigger_words[:num_identities]
 
     trigger_token_ids = [
@@ -358,45 +511,26 @@ def generate_image(pipe, face_detector, device):
 
     print("✅ All trigger words validated correctly.")
 
-
-
-
-    # --------------------------------------------------
-    # Safety check
-    # --------------------------------------------------
-    if len(id_embed_list) == 0:
-        raise ValueError("No face detected! Use images with clear faces.")
-
-
-    # --------------------------------------------------
-    # --------------------------------------------------
-    # Stack identities
-    # --------------------------------------------------
-    id_embeds = torch.stack(id_embed_list)          # [N, 512]
-    id_pixel_values = torch.stack(id_pixel_list)   # [N, 3, H, W]
-
-    print("\n🔥 Final stacked id_embeds shape:", id_embeds.shape)
-    print("🔥 Final stacked id_pixel_values shape:", id_pixel_values.shape)
-
     # --------------------------------------------------
     # Add batch dimension (VERY IMPORTANT)
     # --------------------------------------------------
-    id_embeds = id_embeds.unsqueeze(0)              # [1, N, 512]
-    id_pixel_values = id_pixel_values.unsqueeze(0)  # [1, N, 3, H, W]
+
+    id_embeds = id_embeds.unsqueeze(0)              # [1, N_id, 512]
+    id_pixel_values = id_pixel_values.unsqueeze(0)  # [1, N_id, 3, 224, 224]
 
     print("🔥 After unsqueeze id_embeds:", id_embeds.shape)
     print("🔥 After unsqueeze id_pixel_values:", id_pixel_values.shape)
 
-
-
     # --------------------------------------------------
     # Validate alignment
     # --------------------------------------------------
-    assert id_embeds.shape[0] == id_pixel_values.shape[0], \
+
+    assert id_embeds.shape[1] == id_pixel_values.shape[1], \
         "Mismatch between identity embeddings and pixel tensors!"
 
-    print("✅ Identity count:", id_embeds.shape[0])
-    print("✅ Embedding dimension:", id_embeds.shape[1])
+    print("✅ Identity count:", id_embeds.shape[1])
+    print("✅ Embedding dimension:", id_embeds.shape[2])
+
 
 
     # --------------------------------------------------
@@ -438,69 +572,6 @@ def generate_image(pipe, face_detector, device):
     print("🔥 Built base_masks:", base_masks.shape)
 
 
-    # --------------------------------------------------
-    # 🔥 GET IDENTITY TOKEN INDICES FROM CLASS MASK
-    # --------------------------------------------------
-
-    # class_tokens_mask was created inside pipeline
-    # so we extract indices dynamically during forward
-    # but here we need the grouped structure
-
-    # For multi-trigger, tokens are consecutive per identity
-    # Example: [7,8, 11,12] → [[7,8], [11,12]]
-
-    identity_token_indices = []
-
-    # infer from trigger count and num_tokens
-    num_tokens_per_id = pipe.id_encoder.num_tokens
-    mask_indices = None
-
-    # We will temporarily encode prompt to get mask
-    _, _, _, _, class_tokens_mask = pipe.encode_prompt_with_trigger_word(
-        prompt=prompt,
-        device=device,
-        num_id_images=num_identities
-    )
-
-    mask_indices = class_tokens_mask[0].nonzero().flatten().tolist()
-
-    print("🔥 Mask indices:", mask_indices)
-
-    for i in range(num_identities):
-        start = i * num_tokens_per_id
-        end = start + num_tokens_per_id
-        identity_token_indices.append(mask_indices[start:end])
-
-    print("🔥 identity_token_indices:", identity_token_indices)
-
-
-    # --------------------------------------------------
-    # 🔥 APPLY SPATIAL PROCESSOR TO CROSS-ATTENTION ONLY
-    # --------------------------------------------------
-
-    from photomaker.spatial_identity_attn import SpatialIdentityAttnProcessor
-
-
-    new_processors = {}
-
-    for name, proc in pipe.unet.attn_processors.items():
-
-        if "attn2" in name:  # cross-attention only
-            new_processors[name] = SpatialIdentityAttnProcessor(
-                identity_token_indices,
-                base_masks
-            )
-        else:
-            new_processors[name] = proc
-
-    pipe.unet.set_attn_processor(new_processors)
-
-    print("✅ SpatialIdentityAttnProcessor applied to cross-attn layers only")
-
-
-    print("🔥 input_id_images length:", len(input_id_images))
-    pipe.num_identities = num_identities
-
     images = pipe(
         prompt=prompt,
         width=output_w,
@@ -517,12 +588,65 @@ def generate_image(pipe, face_detector, device):
 
         # ✅ Pass stacked identity embeddings
         id_embeds=id_embeds,
-
+        id_pixel_values=id_pixel_values,
         image=sketch_image,
         adapter_conditioning_scale=adapter_scale,
         adapter_conditioning_factor=adapter_factor,
         identity_bboxes=identity_bboxes,  # 🔥 pass here
     ).images
+
+    print("\n🔍 ArcFace Identity Fidelity Evaluation")
+
+    for img_idx, gen_img in enumerate(images):
+
+        print(f"\n🖼 Generated Image {img_idx}")
+
+        gen_array = np.array(gen_img)[:, :, ::-1]  # RGB → BGR
+        gen_faces = analyze_faces(face_detector, gen_array)
+
+        if len(gen_faces) == 0:
+            print("❌ No face detected in generated image")
+            continue
+        
+        # ✅ Force left → right order
+        gen_faces = sorted(gen_faces, key=lambda f: f.bbox[0])
+        # 🔎 DEBUG: Print bounding boxes
+        for i, face in enumerate(gen_faces):
+            print(f"Face {i} bbox:", face.bbox)
+        # -------------------------------------------------
+        # Collect embeddings for all detected faces
+        # -------------------------------------------------
+        face_embeds = []
+
+        for gen_face in gen_faces:
+            emb = torch.from_numpy(gen_face["embedding"]).float()
+            face_embeds.append(emb)
+
+        face_embeds = torch.stack(face_embeds)  # [num_faces, 512]
+
+        # reference_arcface_embeds already should be a list of tensors
+        ref_embeds = reference_arcface_embeds  # [num_ids, 512]
+
+        # -------------------------------------------------
+        # Dynamic Assignment
+        # -------------------------------------------------
+        assignments, sim_matrix = evaluate_identities_dynamic(
+            face_embeds,
+            ref_embeds
+        )
+
+        # -------------------------------------------------
+        # Pretty Output
+        # -------------------------------------------------
+        print("\n📊 Final Identity Assignment:")
+        for face_idx, assigned_id, score in assignments:
+            print(
+                f"   ✅ Face {face_idx} → Identity {assigned_id} "
+                f"(Cosine: {score:.4f})"
+            )
+
+
+
 
     
     return images, seed
