@@ -234,9 +234,10 @@ def load_pipeline(device):
 
     pipe.unet = IdentitySlotUNet(
         pipe.unet,
-        down_strength=0.3,
-        mid_strength=0.8,
-        up_strength=0.9
+        down_strength=0.2,
+        mid_strength=1.2,
+        up_strength=1.5,
+        temperature=0.35
     )
 
 
@@ -807,7 +808,10 @@ def main():
     
     pipe = load_pipeline(device)
     face_detector = load_face_detector(device)
-    
+    # 🔥 Experiment toggles
+    pipe.enable_routing = False          # disable attention routing
+    pipe.enable_slot_injection = True    # keep additive slot injection
+
     try:
         images, used_seed = generate_image(pipe, face_detector, device)
         
