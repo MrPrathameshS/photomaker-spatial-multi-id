@@ -4,6 +4,10 @@ PhotoMaker V2 CLI - Generate images without Gradio
 Just edit the configuration below and run: python photomaker_cli.py
 """
 print("🚀🚀🚀 RUNNING PHOTOMAKER_CLI.PY 🚀🚀🚀")
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
 import torchvision.transforms.functional as TF
