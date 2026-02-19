@@ -11,9 +11,9 @@ class IdentitySlotUNet(nn.Module):
         self,
         unet,
         down_strength=0.4,
-        mid_strength=0.7,
-        up_strength=0.8,
-        temperature=1.0,
+        mid_strength=1.5,
+        up_strength=1.5,
+        temperature=0.5,
         
     ):
         super().__init__()
@@ -26,7 +26,12 @@ class IdentitySlotUNet(nn.Module):
         self.temperature = temperature
 
         latent_channels = unet.config.block_out_channels[-1]
-        self.proj = nn.Linear(512, latent_channels)
+        self.proj = nn.Sequential(
+            nn.Linear(512, latent_channels),
+            nn.GELU(),
+            nn.Linear(latent_channels, latent_channels),
+        )
+
 
         self.config = unet.config
 
@@ -101,20 +106,22 @@ class IdentitySlotUNet(nn.Module):
     # -------------------------------------------------
 
     def _register_hooks(self):
+        """
+        Additive identity injection:
+        - ❌ No down blocks (avoid early noise corruption)
+        - ✅ Mid block (semantic bottleneck)
+        - ✅ Up blocks (identity crystallization)
+        """
 
-        if len(self.unet.down_blocks) > 0:
-            self.unet.down_blocks[0].register_forward_hook(
-                self._down_block_hook
-            )
-
+        # 🧠 Mid block
         self.unet.mid_block.register_forward_hook(
             self._mid_block_hook
         )
 
-        for i in range(min(2, len(self.unet.up_blocks))):
-            self.unet.up_blocks[i].register_forward_hook(
-                self._up_block_hook
-            )
+        # 🔼 Up blocks only
+        for block in self.unet.up_blocks:
+            block.register_forward_hook(self._up_block_hook)
+
 
     # -------------------------------------------------
     # Core Competitive Injection
@@ -180,6 +187,7 @@ class IdentitySlotUNet(nn.Module):
         projected = projected / (
             projected.norm(dim=2, keepdim=True) + 1e-6
         )
+        projected = projected * C**0.5
 
         # -------------------------------------------------
         # 3️⃣ Build spatial masks
@@ -207,18 +215,24 @@ class IdentitySlotUNet(nn.Module):
 
             # area normalization (prevents large bbox dominance)
             area = max((x2_i - x1_i) * (y2_i - y1_i), 1)
-            masks[:, i] /= float(area)
+            
 
         # If no mask pixels active, skip
         if masks.sum() == 0:
             return hidden_states
 
         # -------------------------------------------------
-        # 4️⃣ Compute similarity scores
+        # 4️⃣ Compute cosine similarity scores
         # -------------------------------------------------
 
         hidden_flat = hidden_states.view(B, C, H * W)
 
+        # Normalize hidden features (TRUE cosine similarity)
+        hidden_flat = hidden_flat / (
+            hidden_flat.norm(dim=1, keepdim=True) + 1e-6
+        )
+
+        # projected is already normalized above
         scores = torch.einsum(
             "bnc,bch->bnh",
             projected,
@@ -227,33 +241,39 @@ class IdentitySlotUNet(nn.Module):
 
         scores = scores.view(B, N, H, W)
 
+        # Apply spatial mask
         scores = scores * masks.squeeze(2)
-
+    
         # -------------------------------------------------
-        # 5️⃣ Competitive softmax
+        # 5️⃣ Controlled Micro-Competition
         # -------------------------------------------------
 
         temperature = getattr(self, "temperature", 1.0)
 
-        weights = torch.softmax(
-            scores / temperature,
-            dim=1
-        )
+        # Independent activation
+        weights = torch.sigmoid(scores / (temperature + 1e-6))
 
-        # Re-apply spatial mask
+        # Apply spatial mask
         weights = weights * masks.squeeze(2)
+
+        # Normalize across identities per pixel
+        weights_sum = weights.sum(dim=1, keepdim=True) + 1e-6
+        weights = weights / weights_sum
+
+        # Optional sharpening (very mild)
+        weights = weights ** 1.2
 
         # -------------------------------------------------
         # 6️⃣ Weighted identity injection
         # -------------------------------------------------
 
         projected = projected.view(B, N, C, 1, 1)
-        weights = weights.unsqueeze(2)
+        weights_expanded = weights.unsqueeze(2)
 
-        total_injection = (weights * projected).sum(dim=1)
+        total_injection = (weights_expanded * projected).sum(dim=1)
 
         # -------------------------------------------------
-        # 7️⃣ Apply injection
+        # 7️⃣ PURE ADDITIVE
         # -------------------------------------------------
 
         hidden_states = hidden_states + strength * total_injection
@@ -261,6 +281,9 @@ class IdentitySlotUNet(nn.Module):
         return hidden_states
 
 
+
+
+        
     # -------------------------------------------------
     # Hooks
     # -------------------------------------------------

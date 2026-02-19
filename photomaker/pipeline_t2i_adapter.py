@@ -174,6 +174,7 @@ def _preprocess_adapter_image(image, height, width):
 
 
 class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipeline):
+
     @validate_hf_hub_args
     def load_photomaker_adapter(
         self,
@@ -724,7 +725,7 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         )
         self._guidance_scale = guidance_scale
         self._clip_skip = clip_skip
-
+    
         #        
         if prompt_embeds is not None and class_tokens_mask is None:
             raise ValueError(
@@ -1001,7 +1002,7 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                     norm = torch.norm(id_embeds[identity_i, token_i]).item()
                     print(f"   Identity {identity_i} Token {token_i} norm: {norm:.4f}")
 
-
+            
            
             # ---------------------------------------
             # Inject
@@ -1120,16 +1121,20 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
 
 
         # --------------------------------------------------
-        # 🔥 ATTACH SPATIAL + ROUTING PROCESSOR
+        # 🔥 OPTIONAL: ATTACH SPATIAL + ROUTING PROCESSOR
         # --------------------------------------------------
 
-        if hasattr(self, "identity_base_masks") and self.identity_base_masks is not None:
+        if (
+            self.enable_routing
+            and hasattr(self, "identity_base_masks")
+            and self.identity_base_masks is not None
+        ):
 
             new_processors = {}
 
             for name, proc in self.unet.attn_processors.items():
 
-                if "attn2" in name:
+                if "attn2" in name:  # cross-attention only
 
                     new_processors[name] = SpatialRoutingProcessor(
                         identity_token_indices=self.identity_token_indices,
@@ -1140,7 +1145,7 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                         identity_bias=2.0,
                         spatial_strength=0.8,
                         outside_suppress=0.7,
-                        routing_strength=8.0,
+                        routing_strength=4.0,
                     )
 
                 else:
@@ -1148,6 +1153,11 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
 
             self.unet.set_attn_processor(new_processors)
             print("✅ SpatialRoutingProcessor attached.")
+
+        else:
+            print("🚫 Routing disabled. Using default attention processors.")
+
+
 
 
 

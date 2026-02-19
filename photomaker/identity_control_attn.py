@@ -1,20 +1,11 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention_processor import AttnProcessor2_0
 import math
 
 
 class SpatialRoutingProcessor(AttnProcessor2_0):
-    """
-    Spatial + Prompt Routing Processor (Final Stable Version)
-
-    Features:
-    - Spatial identity bias
-    - Prompt routing via boosting (not suppression)
-    - Spatially restricted routing
-    - Cross-identity repulsion
-    - Cosine routing schedule
-    """
 
     def __init__(
         self,
@@ -26,14 +17,16 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
         identity_bias=1.5,
         spatial_strength=0.7,
         outside_suppress=0.5,
-        routing_strength=5.0,
-        cross_identity_strength=3.0,
+        routing_strength=4.0,
+        cross_identity_strength=1.5
     ):
         super().__init__()
 
         self.identity_token_indices = identity_token_indices
         self.identity_prompt_map = identity_prompt_map
-        self.base_masks = base_masks  # [N, H, W]
+        self.base_masks = base_masks
+
+    
 
         self.tokenizer = tokenizer
         self.processor_text_input_ids = text_input_ids
@@ -66,9 +59,7 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
         temb=None,
     ):
 
-        # -----------------------------------------
         # Self-attention fallback
-        # -----------------------------------------
         if encoder_hidden_states is None:
             return super().__call__(
                 attn,
@@ -89,6 +80,11 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
+      
+
+        # -----------------------------------------
+        # Attention
+        # -----------------------------------------
         attn_scores = torch.bmm(query, key.transpose(-1, -2))
         attn_scores *= attn.scale
 
@@ -126,15 +122,15 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
         base_bias = self.identity_bias * self.spatial_strength
 
         # -----------------------------------------
-        # Cosine routing schedule
+        # Early-heavy routing schedule
         # -----------------------------------------
         progress = self.current_step / max(self.total_steps, 1)
-        progress = 0.5 * (1 - math.cos(math.pi * progress))
+        progress = 1 - progress
         routing_scale = self.routing_strength * progress
         cross_scale = self.cross_identity_strength * progress
 
         # -----------------------------------------
-        # Apply identity logic
+        # Spatial & Prompt Routing
         # -----------------------------------------
         for identity_i, token_indices in enumerate(self.identity_token_indices):
 
@@ -144,9 +140,7 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
             identity_mask = masks[identity_i]
             identity_mask = identity_mask.view(1, 1, spatial_tokens, 1)
 
-            # -------------------------
-            # 1️⃣ Spatial Bias
-            # -------------------------
+            # Spatial bias
             attn_scores[target_slice, :, :, token_indices] += (
                 base_bias * identity_mask
             )
@@ -157,33 +151,8 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
                 * (1 - identity_mask)
             )
 
-            # -------------------------
-            # 2️⃣ Prompt Boosting (NOT suppression)
-            # -------------------------
+            # Prompt boosting
             allowed_prompt_tokens = self.identity_prompt_map.get(identity_i, [])
-
-            # 🔍 DEBUG ROUTING (first diffusion step only)
-            if (
-                self.current_step == 0
-                and self.processor_text_input_ids is not None
-                and self.tokenizer is not None
-            ):
-                decoded = self.tokenizer.convert_ids_to_tokens(
-                    self.processor_text_input_ids
-                )
-
-                print("\n================ ROUTING DEBUG =================")
-                print(f"Identity {identity_i}")
-                print("Identity token indices:", token_indices)
-                print("Allowed token indices:", allowed_prompt_tokens)
-                print("Allowed tokens:")
-
-                for idx in allowed_prompt_tokens:
-                    if idx < len(decoded):
-                        print(f"  {idx}: {decoded[idx]}")
-
-                print("================================================\n")
-
 
             if len(allowed_prompt_tokens) > 0:
 
@@ -200,9 +169,7 @@ class SpatialRoutingProcessor(AttnProcessor2_0):
                     routing_scale * routing_mask * identity_mask
                 )
 
-            # -------------------------
-            # 3️⃣ Cross-Identity Repulsion
-            # -------------------------
+            # Cross-identity repulsion
             for other_i, other_tokens in enumerate(self.identity_token_indices):
                 if other_i == identity_i or len(other_tokens) == 0:
                     continue
