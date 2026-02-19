@@ -35,11 +35,11 @@ from photomaker.identity_evaluator import evaluate_identities_dynamic
 
 # Input image(s) - provide path(s) to face image(s)
 INPUT_IMAGES = [
-    "/teamspace/studios/this_studio/PhotoMaker/Data/Input/man_woman2.jpg"
+    "/teamspace/studios/this_studio/PhotoMaker/Data/Input/man_woman3.jpg"
 ]
 
 # Prompt - must include 'img' trigger word
-PROMPT = "a man img1 and a woman img2"
+PROMPT = "a man img1 on the left and a woman img2 on the right"
 
 # Output settings 
 OUTPUT_DIR = "/teamspace/studios/this_studio/PhotoMaker/Data/Output"
@@ -57,7 +57,7 @@ OUTPUT_HEIGHT = 1024
 
 # Generation parameters
 NUM_STEPS = 50
-GUIDANCE_SCALE = 5.0
+GUIDANCE_SCALE = 6.0
 STYLE_STRENGTH_RATIO = 20
 SEED = None  # Set to None for random seed, or specify a number
 
@@ -73,6 +73,18 @@ ADAPTER_CONDITIONING_FACTOR = 0.8
 
 MAX_SEED = np.iinfo(np.int32).max
 
+# --------------------------------------------------
+# 🔥 Slot Activation Utility
+# --------------------------------------------------
+
+def compute_active_slots(prompt, trigger_words):
+    active_slots = []
+
+    for i, word in enumerate(trigger_words):
+        if word in prompt:
+            active_slots.append(i)
+
+    return active_slots
 
 def get_device():
     try:
@@ -209,6 +221,23 @@ def load_pipeline(device):
     # --------------------------------------------------
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
+    # ==================================================
+    # 🔥 9️⃣ Wrap UNet with Identity Slot Injection
+    # ==================================================
+    print("\n🔥 Wrapping UNet with Identity Slot Injection...")
+
+    from photomaker.identity_slot_unet import IdentitySlotUNet
+
+    pipe.unet = IdentitySlotUNet(
+        pipe.unet,
+        down_strength=0.3,
+        mid_strength=0.8,
+        up_strength=0.9
+    )
+
+
+    print("✅ UNet successfully wrapped.")
+
     # Final device push
     pipe.to(device)
 
@@ -223,13 +252,38 @@ def load_pipeline(device):
 
 def load_face_detector(device):
     print("Loading face detector...")
-    providers = ['CUDAExecutionProvider'] if device == "cuda" else ['CPUExecutionProvider']
+
+    # -------------------------------------------------
+    # Select ONNX providers
+    # -------------------------------------------------
+    if device == "cuda":
+        providers = ["CUDAExecutionProvider"]
+        ctx_id = 0
+    else:
+        providers = ["CPUExecutionProvider"]
+        ctx_id = -1  # required for CPU in InsightFace
+
+    # -------------------------------------------------
+    # Initialize FaceAnalysis
+    # -------------------------------------------------
     face_detector = FaceAnalysis2(
-        providers=providers, 
-        allowed_modules=['detection', 'recognition']
+        providers=providers,
+        allowed_modules=["detection", "recognition"]
     )
-    face_detector.prepare(ctx_id=0, det_size=(640, 640))
+
+    # -------------------------------------------------
+    # Strong multi-face configuration
+    # -------------------------------------------------
+    face_detector.prepare(
+        ctx_id=ctx_id,
+        det_size=(1024, 1024),   # higher resolution improves multi-face recall
+        det_thresh=0.25          # lower threshold → detect tightly grouped faces
+    )
+
+    print("Face detector loaded successfully.")
     return face_detector
+
+
 
 
 def generate_image(pipe, face_detector, device):
@@ -289,30 +343,29 @@ def generate_image(pipe, face_detector, device):
     # --------------------------------------------------
     # Extract face embeddings (TRUE MULTI-FACE SUPPORT)
     # --------------------------------------------------
+
     id_embed_list = []
     id_pixel_list = []
-    input_id_images = []  # this will now be PER-FACE images
-    bbox_list = []   # ✅ STORE NORMALIZED BBOXES HERE
-
+    input_id_images = []
+    bbox_list = []
 
     for img_idx, img in enumerate(original_images):
 
-        # Convert PIL → numpy BGR for InsightFace
-        img_array = np.array(img)[:, :, ::-1]
+        img_array = np.array(img)[:, :, ::-1]  # RGB → BGR
 
+        # 🔥 Use robust multi-face analyzer
         faces = analyze_faces(face_detector, img_array)
 
         if len(faces) == 0:
             print(f"⚠️ No face detected in image {img_idx}")
             continue
 
-        print(f"\n🔥 Detected {len(faces)} face(s) in image {img_idx}")
+        # 🔥 Force deterministic left → right ordering
+        faces = sorted(faces, key=lambda f: f.bbox[0])
 
-        # --------------------------------------------------
-        # Extract each face as a separate identity
-        # --------------------------------------------------
-        # ✅ PUT DEBUG HERE
+        print(f"\n🔥 Detected {len(faces)} face(s) in image {img_idx}")
         print("Original image size:", img.width, img.height)
+
         for face_idx, face in enumerate(faces):
 
             print(f"\n🔥 Processing face {face_idx} in image {img_idx}")
@@ -336,9 +389,8 @@ def generate_image(pipe, face_detector, device):
 
             print("Normalized bbox:", normalized_bbox)
 
-           
             # --------------------------------------------------
-            # 2️⃣ Extract 512D embedding
+            # 2️⃣ Extract embedding
             # --------------------------------------------------
             raw_embedding = face["embedding"]
 
@@ -347,11 +399,8 @@ def generate_image(pipe, face_detector, device):
 
             id_embed_list.append(torch.from_numpy(raw_embedding).float())
 
-
-
-            
             # --------------------------------------------------
-            # 3️⃣ Align face to 224x224 using landmarks
+            # 3️⃣ Align face to 224x224
             # --------------------------------------------------
             aligned_face = face_align.norm_crop(
                 img_array,
@@ -359,14 +408,11 @@ def generate_image(pipe, face_detector, device):
                 image_size=224
             )
 
-            # Convert BGR → RGB
-            aligned_face = aligned_face[:, :, ::-1]
-
-            # Convert to PIL
+            aligned_face = aligned_face[:, :, ::-1]  # BGR → RGB
             aligned_face = PIL.Image.fromarray(aligned_face)
 
             # --------------------------------------------------
-            # 4️⃣ Preprocess aligned face for SDXL
+            # 4️⃣ Preprocess for SDXL
             # --------------------------------------------------
             pixel_tensor = pipe.image_processor.preprocess(aligned_face)[0]
 
@@ -374,6 +420,7 @@ def generate_image(pipe, face_detector, device):
 
             id_pixel_list.append(pixel_tensor)
             input_id_images.append(aligned_face)
+
 
     
 
@@ -493,23 +540,43 @@ def generate_image(pipe, face_detector, device):
 
     print("🔍 Trigger words:", active_triggers)
 
-    for trigger_word, trigger_id in zip(active_triggers, trigger_token_ids):
+    # --------------------------------------------------
+    # 🔥 Flexible Trigger Activation (NON-STRICT)
+    # --------------------------------------------------
+
+    num_identities = id_embeds.shape[0]
+    active_triggers = pipe.trigger_words[:num_identities]
+
+    trigger_token_ids = [
+        pipe.tokenizer.convert_tokens_to_ids(t)
+        for t in active_triggers
+    ]
+
+    input_ids = pipe.tokenizer.encode(prompt)
+
+    print("🔍 Trigger words:", active_triggers)
+
+    active_slots = []
+
+    for i, (trigger_word, trigger_id) in enumerate(zip(active_triggers, trigger_token_ids)):
 
         count = input_ids.count(trigger_id)
 
         print(f"🔍 '{trigger_word}' appears {count} time(s)")
-
-        if count == 0:
-            raise ValueError(
-                f"Trigger word '{trigger_word}' not found in prompt."
-            )
 
         if count > 1:
             raise ValueError(
                 f"Trigger word '{trigger_word}' appears multiple times."
             )
 
-    print("✅ All trigger words validated correctly.")
+        if count == 1:
+            active_slots.append(i)
+
+    print("✅ Active identity slots:", active_slots)
+
+    # 🔥 Provide active slot mask to UNet
+    pipe.unet.active_slots = active_slots
+
 
     # --------------------------------------------------
     # Add batch dimension (VERY IMPORTANT)
@@ -570,7 +637,65 @@ def generate_image(pipe, face_detector, device):
         base_masks[i, y1_i:y2_i, x1_i:x2_i] = 1.0
 
     print("🔥 Built base_masks:", base_masks.shape)
+    
+    # -----------------------------------------
+    # 🔥 SORT IDENTITIES LEFT → RIGHT
+    # -----------------------------------------
 
+    # identity_bboxes shape: [N, 4]
+    # id_embeds shape: [B, N, 512]  OR  [N, 512]
+
+    # If embeddings are [N, 512]
+    if id_embeds.dim() == 2:
+        centers = (identity_bboxes[:, 0] + identity_bboxes[:, 2]) / 2
+        sorted_indices = torch.argsort(centers)
+
+        identity_bboxes = identity_bboxes[sorted_indices]
+        id_embeds = id_embeds[sorted_indices]
+
+    # If embeddings are [B, N, 512]
+    elif id_embeds.dim() == 3:
+        centers = (identity_bboxes[:, 0] + identity_bboxes[:, 2]) / 2
+        sorted_indices = torch.argsort(centers)
+
+        identity_bboxes = identity_bboxes[sorted_indices]
+        id_embeds = id_embeds[:, sorted_indices, :]
+
+    # -----------------------------------------
+    # 🔥 Compute active slots from prompt
+    # -----------------------------------------
+
+    trigger_words = ["img1", "img2"]   # must match your system
+
+    active_slots = compute_active_slots(PROMPT, trigger_words)
+    if len(active_slots) == 0:
+        print("❌ No identity trigger found in prompt.")
+    else:
+        print("🔥 Active slots:", active_slots)
+
+    pipe.unet.set_active_slots(active_slots)
+    
+
+    # -----------------------------------------
+    # 🔥 Ensure correct device + dtype
+    # -----------------------------------------
+
+    id_embeds = id_embeds.to(pipe.unet.device)
+    id_embeds = id_embeds.to(pipe.unet.dtype)
+
+    identity_bboxes = identity_bboxes.to(pipe.unet.device)
+    identity_bboxes = identity_bboxes.to(pipe.unet.dtype)
+
+    print("🔎 Sorted BBoxes:", identity_bboxes)
+    print("🔎 id_embeds shape:", id_embeds.shape)
+    print("🔎 id_embeds device:", id_embeds.device)
+    print("🔎 id_embeds dtype:", id_embeds.dtype)
+
+    # -----------------------------------------
+    # 🔥 Provide identity data to UNet wrapper
+    # -----------------------------------------
+
+    pipe.unet.set_identity_data(id_embeds, identity_bboxes)
 
     images = pipe(
         prompt=prompt,
@@ -624,8 +749,14 @@ def generate_image(pipe, face_detector, device):
 
         face_embeds = torch.stack(face_embeds)  # [num_faces, 512]
 
-        # reference_arcface_embeds already should be a list of tensors
-        ref_embeds = reference_arcface_embeds  # [num_ids, 512]
+        # -------------------------------------------------
+        # Select only active reference embeddings
+        # -------------------------------------------------
+
+        ref_embeds = torch.stack(
+            [reference_arcface_embeds[i] for i in active_slots]
+        ).to(face_embeds.device)  # shape: [num_active_ids, 512]
+
 
         # -------------------------------------------------
         # Dynamic Assignment
@@ -646,6 +777,13 @@ def generate_image(pipe, face_detector, device):
             )
 
 
+    # -----------------------------------------
+    # 🔥 CLEAR SLOT INJECTION STATE
+    # -----------------------------------------
+
+    
+    pipe.unet.clear_identity_data()
+    print("🧹 Cleared identity slot data from UNet")
 
 
     

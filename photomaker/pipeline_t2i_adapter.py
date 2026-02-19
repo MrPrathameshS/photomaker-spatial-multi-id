@@ -413,28 +413,28 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
 
                 clean_input_ids = []
                 class_tokens_mask = []
+                active_slots = []
 
                 identity_count = 0
-
                 i = 0
+
                 while i < len(input_ids):
 
                     token_id = input_ids[i]
 
-                    # If token is a trigger word
                     if token_id in trigger_token_ids:
+
+                        slot_index = trigger_token_ids.index(token_id)
+                        active_slots.append(slot_index)
 
                         if len(clean_input_ids) == 0:
                             raise ValueError("Trigger word cannot appear at start of prompt.")
 
-                        # The class token is the previous token
                         class_token = clean_input_ids[-1]
 
-                        # Remove previous class token
                         clean_input_ids.pop()
                         class_tokens_mask.pop()
 
-                        # Expand into identity tokens
                         for _ in range(self.num_tokens):
                             clean_input_ids.append(class_token)
                             class_tokens_mask.append(True)
@@ -443,18 +443,14 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                         i += 1
                         continue
 
-                    # Normal token
                     clean_input_ids.append(token_id)
                     class_tokens_mask.append(False)
                     i += 1
 
+                print("✅ Active identity slots:", active_slots)
 
-                # Validate trigger count
-                if identity_count != num_id_images:
-                    raise ValueError(
-                        f"Expected {self.num_identities} triggers {self.trigger_words}, "
-                        f"but found {identity_count} in prompt."
-                    )
+                self.active_slots = active_slots
+
 
 
                 # Truncate or pad
