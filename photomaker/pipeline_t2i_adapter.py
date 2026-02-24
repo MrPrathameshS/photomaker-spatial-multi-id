@@ -681,6 +681,7 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
         """
         print("🔥 id_pixel_values:", None if id_pixel_values is None else id_pixel_values.shape)
         print("🔥 id_embeds:", None if id_embeds is None else id_embeds.shape)
+        print("🔥 CUSTOM PIPELINE FILE LOADED 🔥")
         height, width = self._default_height_width(height, width, image)
         device = self._execution_device
         
@@ -979,7 +980,7 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
             # 🔥 Normalize + Equalize + Scale Identity Embeddings
             # ---------------------------------------
 
-            scale_factor = 28.0  # slightly lower than 35
+            scale_factor = 45.0  # slightly lower than 35
 
             # 1️⃣ Normalize each identity token
             id_embeds = torch.nn.functional.normalize(id_embeds, dim=-1)
@@ -1144,10 +1145,13 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                         base_masks=self.identity_base_masks,
                         tokenizer=self.tokenizer,
                         text_input_ids=self.processor_text_input_ids,
-                        identity_bias=2.0,
-                        spatial_strength=0.8,
-                        outside_suppress=0.7,
-                        routing_strength=4.0,
+
+                        # --- Routing strengths ---
+                        identity_bias=2.5,              # own identity boost
+                        spatial_strength=1.0,           # spatial emphasis
+                        outside_suppress=1.5,           # suppress outside region
+                        routing_strength=6.0,           # attribute boost
+                        cross_identity_strength=6.0,    # suppress other identities
                     )
 
                 else:
@@ -1197,9 +1201,15 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
 
         identity_A_spatial = []
         identity_B_spatial = []
+        if isinstance(self.unet, IdentitySlotUNet):
+                    self.unet.debug_similarity = []
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                
+                # 🔥 Set current step here
+                if isinstance(self.unet, IdentitySlotUNet):
+                    self.unet.current_step = i
                 # --------------------------------------------------
                 # 🔥 1️⃣ DELAYED MERGE LOGIC (FIRST)
                 # --------------------------------------------------
@@ -1360,6 +1370,11 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
                 )[0]
+                # 🔬 DEBUG HERE
+                if isinstance(self.unet, IdentitySlotUNet):
+                    print("Similarity length after Stream A:",
+                        len(self.unet.debug_similarity))
+                
 
                 if self.do_classifier_free_guidance:
                     noise_uncond_A, noise_text_A = noise_pred_A.chunk(2)
@@ -1436,7 +1451,144 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
 
                 z_A = latents.clone()
                 z_B = latents.clone()
+                # --------------------------------------------------
+                # --------------------------------------------------
+                # 🔎 DEBUG IMAGE AT start_merge_step + MID PHASE
+                # 🔬 Identity Similarity-Based Bounding Box (UNet space)
+                # --------------------------------------------------
 
+                mid_step = int(num_inference_steps * 0.5)
+
+                if i == start_merge_step or i == mid_step:
+
+                    phase_name = (
+                        "start_merge_step"
+                        if i == start_merge_step
+                        else "mid_phase"
+                    )
+
+                    print(f"\n🧪 Decoding image at {phase_name} = {i}")
+
+                    debug_latents = latents.clone()
+
+                    # -----------------------------
+                    # Safe VAE decode
+                    # -----------------------------
+                    needs_upcasting = (
+                        self.vae.dtype == torch.float16
+                        and self.vae.config.force_upcast
+                    )
+
+                    if needs_upcasting:
+                        self.upcast_vae()
+                        debug_latents = debug_latents.to(
+                            next(iter(self.vae.post_quant_conv.parameters())).dtype
+                        )
+
+                    decoded = self.vae.decode(
+                        debug_latents / self.vae.config.scaling_factor,
+                        return_dict=False
+                    )[0]
+
+                    debug_images = self.image_processor.postprocess(
+                        decoded,
+                        output_type="pil"
+                    )
+
+                    debug_image = debug_images[0]
+
+                    # --------------------------------------------------
+                    # 🔬 GET ARGMAX IDENTITY SEGMENTATION
+                    # --------------------------------------------------
+
+                    import numpy as np
+                    from PIL import Image
+                    import torch.nn.functional as F
+
+                    if (
+                        hasattr(self.unet, "debug_similarity")
+                        and len(self.unet.debug_similarity) > 0
+                    ):
+
+                        similarity_entry = self.unet.debug_similarity[-1]
+
+                        if "scores" not in similarity_entry:
+                            print("⚠️ No full score tensor found (check _inject logging).")
+
+                        else:
+                            scores = similarity_entry["scores"]  # [B, N, H, W]
+
+                            # Remove batch dimension
+                            scores = scores[0]  # [N, H, W]
+
+                            if scores.shape[0] < 2:
+                                print("⚠️ Only one identity present — argmax segmentation meaningless.")
+                            else:
+                                # ---------------------------------
+                                # 1️⃣ Argmax over identities
+                                # ---------------------------------
+                                identity_map = torch.argmax(scores, dim=0)  # [H, W]
+
+                                # ---------------------------------
+                                # 2️⃣ Upsample to image resolution
+                                # ---------------------------------
+                                identity_map = identity_map.unsqueeze(0).unsqueeze(0).float()
+
+                                img_w, img_h = debug_image.size
+
+                                identity_map_up = F.interpolate(
+                                    identity_map,
+                                    size=(img_h, img_w),
+                                    mode="nearest"
+                                )[0, 0].long()  # [H_img, W_img]
+
+                                identity_np = identity_map_up.cpu().numpy()
+
+                                # ---------------------------------
+                                # 3️⃣ Define identity colors
+                                # ---------------------------------
+                                colors = [
+                                    (255, 0, 0),    # Identity 0 → Red
+                                    (0, 0, 255),    # Identity 1 → Blue
+                                    (0, 255, 0),    # Identity 2 → Green
+                                    (255, 255, 0),  # Identity 3 → Yellow
+                                ]
+
+                                overlay = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                                num_ids = scores.shape[0]
+
+                                for i_id in range(min(num_ids, len(colors))):
+                                    overlay[identity_np == i_id] = colors[i_id]
+
+                                overlay_img = Image.fromarray(overlay)
+
+                                # ---------------------------------
+                                # 4️⃣ Blend overlay with decoded image
+                                # ---------------------------------
+                                debug_image = Image.blend(
+                                    debug_image.convert("RGBA"),
+                                    overlay_img.convert("RGBA"),
+                                    alpha=0.4
+                                )
+
+                                print("✅ Argmax identity segmentation generated")
+
+                    else:
+                        print("⚠️ No similarity map available from UNet")
+
+                    # --------------------------------------------------
+                    # Save
+                    # --------------------------------------------------
+
+                    debug_path = (
+                        f"/teamspace/studios/this_studio/PhotoMaker/Data/Output/"
+                        f"debug_{phase_name}_step_{i}.png"
+                    )
+
+                    debug_image.save(debug_path)
+
+                    print("✅ Saved debug image:", debug_path)
                 # --------------------------------------------------
                 # CALLBACK (MUST BE INSIDE LOOP)
                 # --------------------------------------------------

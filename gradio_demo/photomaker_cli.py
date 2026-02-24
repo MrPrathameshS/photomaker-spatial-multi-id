@@ -43,7 +43,7 @@ INPUT_IMAGES = [
 ]
 
 # Prompt - must include 'img' trigger word
-PROMPT = "a man img1 and woman img2"
+PROMPT = "a man img1 wearimg sunglasses  and woman img2 wearing a hat"
 # Output settings 
 OUTPUT_DIR = "/teamspace/studios/this_studio/PhotoMaker/Data/Output"
 NUM_OUTPUTS = 2
@@ -60,7 +60,7 @@ OUTPUT_HEIGHT = 1024
 
 # Generation parameters
 NUM_STEPS = 50
-GUIDANCE_SCALE = 6.0
+GUIDANCE_SCALE = 7.5
 STYLE_STRENGTH_RATIO = 20
 SEED = None  # Set to None for random seed, or specify a number
 
@@ -231,13 +231,13 @@ def load_pipeline(device):
 
     from photomaker.identity_slot_unet import IdentitySlotUNet
 
-    #pipe.unet = IdentitySlotUNet(
-    #    pipe.unet,
-    #    down_strength=0.0,
-    #    mid_strength=1.0,
-    #    up_strength=1.2,
-    #    temperature=0.6
-    #)
+    pipe.unet = IdentitySlotUNet(
+        pipe.unet,
+        down_strength=0.0,
+        mid_strength=0.0,
+        up_strength=0.2,
+        temperature=0.0
+    )
 
 
     print("✅ UNet successfully wrapped.")
